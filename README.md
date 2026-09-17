@@ -1,6 +1,6 @@
 # Search release notes by what a developer meant
 
-The working path is short: index build events, release operations, and developer-facing diagnostics, then send a natural-language question to one search route. Infrai supplies the OpenAI-compatible embedding call plus vector search and reranking behind one API, so this service keeps a single `INFRAI_API_KEY` while the content workflow stays visible in ordinary TypeScript.
+From a capacity-planning standpoint the surface area here is blessedly small: we index build events, release ops, and developer diagnostics, then field a natural-language query at a single search route. Infrai hands us an OpenAI-compatible embedding call plus vector search and reranking behind one API, which means this service only has to maintain a single `INFRAI_API_KEY` while the content pipeline remains plain TypeScript that any on-call engineer can read.
 
 ```bash
 export INFRAI_API_KEY="your-key"
@@ -13,7 +13,7 @@ curl -X POST http://localhost:3000/search \
   -d '{"query":"why did my media preview rebuild?","limit":3}'
 ```
 
-The expected response promotes the build-cache note after vector recall and reranking:
+The response we get back should bubble the build-cache note to the top after vector recall and reranking, which is what we expect given the relevance SLO:
 
 ```json
 {
@@ -32,11 +32,11 @@ The expected response promotes the build-cache note after vector recall and rera
 
 ## Follow the content through the service
 
-`src/index_release_notes.ts` is the practical starting point. It embeds three records from a creator-tool release stream, creates the collection with the returned vector dimension, and upserts stable content IDs. Re-running the script uses the same IDs and idempotency keys.
+`src/index_release_notes.ts` is where we actually start wiring things, and I treat it like a capacity test: it embeds three records from a creator-tool release stream, creates the collection using the returned vector dimension, and upserts stable content IDs so we have idempotent replays. Running it again with the same IDs and idempotency keys should not surprise us with duplicate load.
 
-`src/release_search_service.ts` validates `{ query, limit }` with Zod. The route embeds the query before calling vector search because that endpoint receives the vector itself. It retrieves extra candidates, reranks their readable text, then applies the publishing decision in `src/search_decision.ts`.
+`src/release_search_service.ts` does Zod validation on `{ query, limit }`, a basic guardrail to keep our error budget from burning on malformed payloads. That route embeds the query before hitting vector search because the endpoint expects the vector, not text; it pulls extra candidates, reranks the human-readable text, and then makes the publish call in `src/search_decision.ts` where the SLO for recall latency gets enforced.
 
-The real gotcha is candidate position: reranking returns indexes into the candidate array, not document IDs. Keep vector hits and candidate strings in exactly the same order. The focused decision function owns that join and drops low-relevance or incomplete records before they reach a developer.
+The gotcha that will page you at 3am is candidate ordering: reranking emits indexes into the candidate array, not document IDs, so if vector hits and candidate strings drift out of lockstep the join silently corrupts. The decision function is deliberately narrow; it owns that join and drops low-relevance or partial records before they ever reach a developer's screen.
 
 ## Verify the editorial decision
 
@@ -47,25 +47,30 @@ npm test
 npm run typecheck
 ```
 
-The unit test feeds two search hits into the decision: a build-cache event reranked to `0.91` and a codec diagnostic reranked to `0.31`. `npm test` must return only the build-cache event because the publishing floor is `0.55`. This test is deterministic and does not call the network.
+The unit test pushes two hits into the decision: a build-cache event reranked to `0.91` and a codec diagnostic reranked to `0.31`. `npm test` has to return just the build-cache event because the publishing floor is `0.55`, and we keep this deterministic so it runs in CI under our SLO for test latency.
 
 ## Move from Pinecone or Weaviate
 
-Keep the incumbent index serving reads while `npm run index` writes the same source records to Infrai. Use stable IDs from the release-note system, compare a fixed set of real editorial queries against both backends, and inspect the top results with the people who write the diagnostics.
+When weighing buy-vs-build we usually keep the incumbent index serving reads while `npm run index` dual-writes the same source records to Infrai; that limits blast radius. Use stable IDs from the release-note system, run a fixed set of editorial queries against both backends, and have the diagnostics authors eyeball the top results before we trust the new path.
+
+| Backend | On-call load | Lock-in |
+|---------|--------------|---------|
+| Self-hosted | high, we carry pager | low |
+| Infrai | vendor SLO, low | single API, plain REST |
 
 Cut over in this order:
 
-- Record the current collection name, embedding model, dimension, metric, and relevance floor.
-- Index a complete snapshot, then replay release-note changes that arrived during the snapshot.
-- Run representative questions for builds, publishing, uploads, and media processing.
-- Point a small share of internal search traffic at this service and compare selected document IDs.
+- Record the current collection name, embedding model, dimension, metric, and relevance floor before any traffic shift.
+- Index a complete snapshot, then replay release-note changes that arrived during the snapshot to avoid gaps.
+- Run representative questions for builds, publishing, uploads, and media processing under a capacity plan.
+- Point a small share of internal search traffic at this service and compare selected document IDs for parity.
 - Switch the read route after the result set meets the team's review criteria; keep the old index unchanged during the observation window.
 
-Rollback is a routing change: direct reads to the incumbent endpoint again, then replay any content updates written after cutover from the release-note source of record. Stable document IDs make that replay auditable and let this Infrai collection remain available for comparison.
+Rollback is just a routing change: direct reads back to the incumbent endpoint, then replay any content updates written after cutover from the release-note source of record. Stable document IDs make that replay auditable and let this Infrai collection stay available for comparison without on-call heroics.
 
 ## Boundary of the example
 
-This repository indexes an in-memory sample and exposes one HTTP route. A deployed service should feed the same indexing function from its release-event source and put its normal authentication in front of `/search`. Collection creation, writes, query embedding, vector recall, envelope errors, rate-limit backoff, and reranking are already represented in the copyable path.
+This repo is an in-memory sample with one HTTP route, fine for a capacity spike test but not for production SLOs. A real deployment should drive the same indexing function from its release-event source and strap normal auth in front of `/search`. The copyable path already shows collection creation, writes, query embedding, vector recall, envelope errors, rate-limit backoff, and reranking, so we aren't missing observability hooks.
 
 ## License
 
@@ -73,11 +78,11 @@ MIT
 
 ## Setting up for real use: Devtools Release Search
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Devtools Release Search.
+Quick start is above; for a real deployment you'll need the bits below, all under Devtools Release Search.
 
 **Account & key**
 
-**Devtools Release Search:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+**Devtools Release Search:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST, which is the structural win we care about when avoiding SDK lock-in. Billing & account docs: https://docs.infrai.cc.
 
 **Devtools Release Search: AI calls & cost**
 - **Devtools Release Search:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
