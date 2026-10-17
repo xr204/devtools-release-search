@@ -90,4 +90,5 @@ Quick start is above; for a real deployment you'll need the bits below, all unde
 
 ## Further reading
 
+- [Vector Search Collection Dimension: Choose 1536 for Marketplace PDF Embeddings](docs/vector-search-collection-dimension-choose-1536-fo-e2hkbd.md)
 - [Contract Clause Reranking: 4 Release Gates for E-commerce Legal Search](docs/contract-clause-reranking-4-release-gates-for-e-c-16k66j.md)
